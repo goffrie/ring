@@ -24,7 +24,6 @@ use crate::{
     error,
     polyfill::{self, ChunksFixed},
 };
-use core::ops::RangeFrom;
 
 #[derive(Clone)]
 pub(crate) struct Key {
@@ -79,7 +78,7 @@ fn encrypt_block_(
 }
 
 macro_rules! ctr32_encrypt_blocks {
-    ($name:ident, $in_out:expr, $src:expr, $key:expr, $ivec:expr ) => {{
+    ($name:ident, $input:expr, $output:expr, $len:expr, $key:expr, $ivec:expr ) => {{
         prefixed_extern! {
             fn $name(
                 input: *const [u8; BLOCK_LEN],
@@ -89,12 +88,12 @@ macro_rules! ctr32_encrypt_blocks {
                 ivec: &Counter,
             );
         }
-        ctr32_encrypt_blocks_($name, $in_out, $src, $key, $ivec)
+        ctr32_encrypt_blocks_($name, $input, $output, $len, $key, $ivec)
     }};
 }
 
 #[inline]
-fn ctr32_encrypt_blocks_(
+unsafe fn ctr32_encrypt_blocks_(
     f: unsafe extern "C" fn(
         input: *const [u8; BLOCK_LEN],
         output: *mut [u8; BLOCK_LEN],
@@ -102,24 +101,25 @@ fn ctr32_encrypt_blocks_(
         key: &AES_KEY,
         ivec: &Counter,
     ),
-    in_out: &mut [u8],
-    src: RangeFrom<usize>,
+    input: *const u8,
+    output: *mut u8,
+    len: usize,
     key: &AES_KEY,
     ctr: &mut Counter,
 ) {
-    let in_out_len = in_out[src.clone()].len();
-    assert_eq!(in_out_len % BLOCK_LEN, 0);
+    assert_eq!(len % BLOCK_LEN, 0);
 
-    let blocks = in_out_len / BLOCK_LEN;
+    let blocks = len / BLOCK_LEN;
     let blocks_u32 = blocks as u32;
     assert_eq!(blocks, polyfill::usize_from_u32(blocks_u32));
 
-    let input = in_out[src].as_ptr() as *const [u8; BLOCK_LEN];
-    let output = in_out.as_mut_ptr() as *mut [u8; BLOCK_LEN];
-
-    unsafe {
-        f(input, output, blocks, key, ctr);
-    }
+    f(
+        input.cast::<[u8; BLOCK_LEN]>(),
+        output.cast::<[u8; BLOCK_LEN]>(),
+        blocks,
+        key,
+        ctr,
+    );
     ctr.increment_by_less_safe(blocks_u32);
 }
 
@@ -206,16 +206,18 @@ impl Key {
         encrypted_iv ^ input
     }
 
+    // Safety:
+    // - `input` must be valid for reads for `len` bytes, and those bytes must be initialized
+    // - `output` must be valid for writes for `len` bytes
     #[inline]
-    pub(super) fn ctr32_encrypt_within(
+    pub(super) unsafe fn ctr32_encrypt(
         &self,
-        in_out: &mut [u8],
-        src: RangeFrom<usize>,
+        input: *const u8,
+        output: *mut u8,
+        len: usize,
         ctr: &mut Counter,
     ) {
-        let in_out_len = in_out[src.clone()].len();
-
-        assert_eq!(in_out_len % BLOCK_LEN, 0);
+        assert_eq!(len % BLOCK_LEN, 0);
 
         match detect_implementation(self.cpu_features) {
             #[cfg(any(
@@ -225,19 +227,26 @@ impl Key {
                 target_arch = "x86"
             ))]
             Implementation::HWAES => {
-                ctr32_encrypt_blocks!(aes_hw_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
+                ctr32_encrypt_blocks!(
+                    aes_hw_ctr32_encrypt_blocks,
+                    input,
+                    output,
+                    len,
+                    &self.inner,
+                    ctr
+                )
             }
 
             #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64"))]
             Implementation::VPAES_BSAES => {
                 // 8 blocks is the cut-off point where it's faster to use BSAES.
                 #[cfg(target_arch = "arm")]
-                let in_out = if in_out_len >= 8 * BLOCK_LEN {
-                    let remainder = in_out_len % (8 * BLOCK_LEN);
-                    let bsaes_in_out_len = if remainder < (4 * BLOCK_LEN) {
-                        in_out_len - remainder
+                let (input, output, len) = if len >= 8 * BLOCK_LEN {
+                    let remainder = len % (8 * BLOCK_LEN);
+                    let bsaes_len = if remainder < (4 * BLOCK_LEN) {
+                        len - remainder
                     } else {
-                        in_out_len
+                        len
                     };
 
                     let mut bsaes_key = AES_KEY {
@@ -252,30 +261,57 @@ impl Key {
                     }
                     ctr32_encrypt_blocks!(
                         bsaes_ctr32_encrypt_blocks,
-                        &mut in_out[src.clone()][bsaes_in_out_len..],
-                        src.clone(),
+                        input,
+                        output,
+                        bsaes_len,
                         &bsaes_key,
                         ctr
                     );
 
-                    &mut in_out[src.clone()][bsaes_in_out_len..]
+                    (input.add(bsaes_len), output.add(bsaes_len), len - bsaes_len)
                 } else {
-                    in_out
+                    (input, output, len)
                 };
 
-                ctr32_encrypt_blocks!(vpaes_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
+                ctr32_encrypt_blocks!(
+                    vpaes_ctr32_encrypt_blocks,
+                    input,
+                    output,
+                    len,
+                    &self.inner,
+                    ctr
+                )
             }
 
             #[cfg(any(target_arch = "x86"))]
             Implementation::VPAES_BSAES => {
-                super::shift::shift_full_blocks(in_out, src, |input| {
-                    self.encrypt_iv_xor_block(ctr.increment(), Block::from(input))
-                });
+                assert!(len <= isize::MAX as usize);
+                for i in (0..len).step_by(BLOCK_LEN) {
+                    // Safety:
+                    // - `input` is assumed to be valid for `len` bytes
+                    // - `i` is a multiple of `BLOCK_LEN` strictly less than `len`
+                    // - `len` is a multiple of `BLOCK_LEN`
+                    // - therefore, `input.add(i)` is valid for at least `BLOCK_LEN` bytes
+                    let input_block =
+                        unsafe { Block::from(&*input.add(i).cast::<[u8; BLOCK_LEN]>()) };
+                    let encrypted_block = self.encrypt_iv_xor_block(ctr.increment(), input_block);
+                    // The same argument applies to `output`
+                    unsafe {
+                        *output.add(i).cast::<[u8; BLOCK_LEN]>() = *encrypted_block.as_ref();
+                    }
+                }
             }
 
             #[cfg(not(target_arch = "aarch64"))]
             Implementation::NOHW => {
-                ctr32_encrypt_blocks!(aes_nohw_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
+                ctr32_encrypt_blocks!(
+                    aes_nohw_ctr32_encrypt_blocks,
+                    input,
+                    output,
+                    len,
+                    &self.inner,
+                    ctr
+                )
             }
         }
     }

@@ -101,4 +101,22 @@ impl<N: NonceSequence> SealingKey<N> {
         self.key
             .seal_in_place_separate_tag(self.nonce_sequence.advance()?, aad, in_out)
     }
+
+    /// Encrypts and signs (“seals”) data.
+    ///
+    /// The ciphertext is appended to `output`. The tag is returned separately.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn seal_to_vec_separate_tag<A>(
+        &mut self,
+        aad: Aad<A>,
+        plaintext: &[u8],
+        output: &mut alloc::vec::Vec<u8>,
+    ) -> Result<Tag, error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        self.key
+            .seal_to_vec_separate_tag(self.nonce_sequence.advance()?, aad, plaintext, output)
+    }
 }

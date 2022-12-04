@@ -140,4 +140,25 @@ impl<N: NonceSequence> OpeningKey<N> {
             ciphertext_and_tag,
         )
     }
+
+    /// Authenticates and decrypts (“opens”) data.
+    ///
+    /// `aad` is the additional authenticated data (AAD), if any.
+    /// `input` must be the ciphertext followed by the tag.
+    ///
+    /// If the decryption was successful, the plaintext is appended to `output`.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn open_to_vec<A>(
+        &mut self,
+        aad: Aad<A>,
+        ciphertext: &[u8],
+        output: &mut alloc::vec::Vec<u8>,
+    ) -> Result<(), error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        self.key
+            .open_to_vec(self.nonce_sequence.advance()?, aad, ciphertext, output)
+    }
 }

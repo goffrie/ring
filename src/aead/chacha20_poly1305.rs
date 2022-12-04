@@ -17,7 +17,7 @@ use super::{
     poly1305, Aad, Nonce, Tag,
 };
 use crate::{aead, cpu, endian::*, error, polyfill};
-use core::ops::RangeFrom;
+use core::slice;
 
 /// ChaCha20-Poly1305 as described in [RFC 8439].
 ///
@@ -45,11 +45,14 @@ fn chacha20_poly1305_init(
     )))
 }
 
-fn chacha20_poly1305_seal(
+// See the comments on `Algorithm::seal` for the safety invariants of this function.
+unsafe fn chacha20_poly1305_seal(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
-    in_out: &mut [u8],
+    plaintext: *const u8,
+    out_ciphertext: *mut u8,
+    len: usize,
 ) -> Tag {
     let chacha20_key = match key {
         aead::KeyInner::ChaCha20Poly1305(key) => key,
@@ -98,20 +101,15 @@ fn chacha20_poly1305_seal(
                     data: &mut InOut<seal_data_in>,
                 );
             }
-
-            let out = unsafe {
-                chacha20_poly1305_seal(
-                    in_out.as_mut_ptr(),
-                    in_out.as_ptr(),
-                    in_out.len(),
-                    aad.as_ref().as_ptr(),
-                    aad.as_ref().len(),
-                    &mut data,
-                );
-                &data.out
-            };
-
-            return Tag(out.tag);
+            chacha20_poly1305_seal(
+                out_ciphertext,
+                plaintext,
+                len,
+                aad.as_ref().as_ptr(),
+                aad.as_ref().len(),
+                &mut data,
+            );
+            return Tag(data.out.tag);
         }
     }
 
@@ -122,17 +120,20 @@ fn chacha20_poly1305_seal(
     };
 
     poly1305_update_padded_16(&mut auth, aad.as_ref());
-    chacha20_key.encrypt_in_place(counter, in_out);
-    poly1305_update_padded_16(&mut auth, in_out);
-    finish(auth, aad.as_ref().len(), in_out.len())
+    chacha20_key.encrypt(counter, plaintext, out_ciphertext, len);
+    // Safety: `encrypt()` initializes `len` bytes of `output`
+    poly1305_update_padded_16(&mut auth, slice::from_raw_parts(out_ciphertext, len));
+    finish(auth, aad.as_ref().len(), len)
 }
 
-fn chacha20_poly1305_open(
+// See the comments on `Algorithm::open` for the safety invariants of this function.
+unsafe fn chacha20_poly1305_open(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
-    in_out: &mut [u8],
-    src: RangeFrom<usize>,
+    ciphertext: *const u8,
+    out_plaintext: *mut u8,
+    len: usize,
 ) -> Tag {
     let chacha20_key = match key {
         aead::KeyInner::ChaCha20Poly1305(key) => key,
@@ -178,19 +179,16 @@ fn chacha20_poly1305_open(
                 );
             }
 
-            let out = unsafe {
-                chacha20_poly1305_open(
-                    in_out.as_mut_ptr(),
-                    in_out.as_ptr().add(src.start),
-                    in_out.len() - src.start,
-                    aad.as_ref().as_ptr(),
-                    aad.as_ref().len(),
-                    &mut data,
-                );
-                &data.out
-            };
+            chacha20_poly1305_open(
+                out_plaintext,
+                ciphertext,
+                len,
+                aad.as_ref().as_ptr(),
+                aad.as_ref().len(),
+                &mut data,
+            );
 
-            return Tag(out.tag);
+            return Tag(data.out.tag);
         }
     }
 
@@ -201,9 +199,9 @@ fn chacha20_poly1305_open(
     };
 
     poly1305_update_padded_16(&mut auth, aad.as_ref());
-    poly1305_update_padded_16(&mut auth, &in_out[src.clone()]);
-    chacha20_key.encrypt_within(counter, in_out, src.clone());
-    finish(auth, aad.as_ref().len(), in_out[src].len())
+    poly1305_update_padded_16(&mut auth, slice::from_raw_parts(ciphertext, len));
+    chacha20_key.encrypt(counter, ciphertext, out_plaintext, len);
+    finish(auth, aad.as_ref().len(), len)
 }
 
 fn finish(mut auth: poly1305::Context, aad_len: usize, in_out_len: usize) -> Tag {

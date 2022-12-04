@@ -107,6 +107,51 @@ impl LessSafeKey {
         self.open_in_place_separate_tag(nonce, aad, received_tag, in_out, ciphertext)
     }
 
+    /// Like [`super::OpeningKey::open_to_vec()`], except it accepts an
+    /// arbitrary nonce.
+    ///
+    /// `nonce` must be unique for every use of the key to open data.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn open_to_vec<A>(
+        &self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        ciphertext_and_tag: &[u8],
+        output: &mut alloc::vec::Vec<u8>,
+    ) -> Result<(), error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        let ciphertext_len = ciphertext_and_tag
+            .len()
+            .checked_sub(TAG_LEN)
+            .ok_or(error::Unspecified)?;
+        check_per_nonce_max_bytes(self.algorithm, ciphertext_len)?;
+        let received_tag = Tag(ciphertext_and_tag[ciphertext_len..].try_into()?);
+        let aad = Aad::from(aad.as_ref());
+        let ciphertext = &ciphertext_and_tag[..ciphertext_len];
+        output.reserve(ciphertext_len);
+        unsafe {
+            // Safety: `ciphertext` is a slice with length `ciphertext_len`, so `ciphertext.as_ptr()` points to `ciphertext_len` readable bytes.
+            // `out` has additional capacity at least `ciphertext_len`, so `output.spare_capacity_mut()` points to `ciphertext_len` writable bytes.
+            let calculated_tag = (self.algorithm.open)(
+                &self.inner,
+                nonce,
+                aad,
+                ciphertext.as_ptr(),
+                output.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                ciphertext_len,
+            );
+            constant_time::verify_slices_are_equal(calculated_tag.as_ref(), received_tag.as_ref())?;
+            // We wait until the tag is verified before extending `output`.
+            // XXX: is this safe enough? the unchecked plaintext is technically still accessible
+            // Safety: `self.algorithm.open` promises to initialize the first `ciphertext_len` bytes of its output pointer.
+            output.set_len(output.len() + ciphertext_len);
+        }
+        Ok(())
+    }
+
     /// Like [`super::SealingKey::seal_in_place_append_tag()`], except it
     /// accepts an arbitrary nonce.
     ///
@@ -143,6 +188,43 @@ impl LessSafeKey {
         seal_in_place_separate_tag_(self, nonce, Aad::from(aad.as_ref()), in_out)
     }
 
+    /// Like [`super::SealingKey::seal_to_vec_separate_tag()`], except it accepts an
+    /// arbitrary nonce.
+    ///
+    /// `nonce` must be unique for every use of the key to open data.
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub fn seal_to_vec_separate_tag<A>(
+        &self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        plaintext: &[u8],
+        output: &mut alloc::vec::Vec<u8>,
+    ) -> Result<Tag, error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        let plaintext_len = plaintext.len();
+        check_per_nonce_max_bytes(self.algorithm, plaintext_len)?;
+        let aad = Aad::from(aad.as_ref());
+        output.reserve(plaintext_len);
+        unsafe {
+            // Safety: `plaintext` is a slice with length `plaintext_len`, so `plaintext.as_ptr()` points to `plaintext_len` readable bytes.
+            // `output` has additional capacity at least `plaintext_len`, so `output.spare_capacity_mut()` points to `plaintext_len` writable bytes.
+            let tag = (self.algorithm.seal)(
+                &self.inner,
+                nonce,
+                aad,
+                plaintext.as_ptr(),
+                output.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                plaintext_len,
+            );
+            // Safety: `self.algorithm.seal` promises to initialize the first `plaintext_len` bytes of its output pointer.
+            output.set_len(output.len() + plaintext_len);
+            Ok(tag)
+        }
+    }
+
     /// The key's AEAD algorithm.
     #[inline]
     pub fn algorithm(&self) -> &'static Algorithm {
@@ -168,10 +250,26 @@ fn open_within_<'in_out>(
     in_out: &'in_out mut [u8],
     src: RangeFrom<usize>,
 ) -> Result<&'in_out mut [u8], error::Unspecified> {
-    let ciphertext_len = in_out.get(src.clone()).ok_or(error::Unspecified)?.len();
+    let ciphertext_len = in_out
+        .len()
+        .checked_sub(src.start)
+        .ok_or(error::Unspecified)?;
     check_per_nonce_max_bytes(key.algorithm, ciphertext_len)?;
 
-    let Tag(calculated_tag) = (key.algorithm.open)(&key.inner, nonce, aad, in_out, src);
+    let Tag(calculated_tag) = unsafe {
+        let in_out_ptr = in_out.as_mut_ptr();
+        // Safety: `in_out_ptr` points to `in_out.len()` valid read/writeable bytes.
+        // Therefore `in_out_ptr.add(src.start)` is valid for `in_out.len() - src.start` bytes;
+        // that is equal to `ciphertext_len`.
+        (key.algorithm.open)(
+            &key.inner,
+            nonce,
+            aad,
+            in_out_ptr.add(src.start),
+            in_out_ptr,
+            ciphertext_len,
+        )
+    };
 
     if constant_time::verify_slices_are_equal(calculated_tag.as_ref(), received_tag.as_ref())
         .is_err()
@@ -198,7 +296,11 @@ pub(super) fn seal_in_place_separate_tag_(
     in_out: &mut [u8],
 ) -> Result<Tag, error::Unspecified> {
     check_per_nonce_max_bytes(key.algorithm(), in_out.len())?;
-    Ok((key.algorithm.seal)(&key.inner, nonce, aad, in_out))
+    Ok(unsafe {
+        let in_out_ptr = in_out.as_mut_ptr();
+        // Safety: `in_out_ptr` points to `in_out.len()` valid read/writeable bytes.
+        (key.algorithm.seal)(&key.inner, nonce, aad, in_out_ptr, in_out_ptr, in_out.len())
+    })
 }
 
 fn check_per_nonce_max_bytes(alg: &Algorithm, in_out_len: usize) -> Result<(), error::Unspecified> {

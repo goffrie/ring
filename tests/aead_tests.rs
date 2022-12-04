@@ -60,12 +60,16 @@ macro_rules! test_aead {
                         [
                             less_safe_key_open_in_place,
                             less_safe_key_open_within,
+                            less_safe_key_open_to_vec,
                             less_safe_key_seal_in_place_append_tag,
                             less_safe_key_seal_in_place_separate_tag,
+                            less_safe_key_seal_to_vec_separate_tag,
                             opening_key_open_in_place,
                             opening_key_open_within,
+                            opening_key_open_to_vec,
                             sealing_key_seal_in_place_append_tag,
                             sealing_key_seal_in_place_separate_tag,
+                            sealing_key_seal_to_vec_separate_tag,
                             test_open_in_place_seperate_tag,
                         ]);
 
@@ -165,6 +169,29 @@ where
     let actual_tag = seal(aead::Nonce::assume_unique_for_key(tc.nonce), &mut in_out)?;
     assert_eq!(actual_tag.as_ref(), tc.tag);
     assert_eq!(in_out, tc.ciphertext);
+
+    Ok(())
+}
+
+fn test_seal_to_vec_separate_tag<Seal>(
+    tc: &KnownAnswerTestCase,
+    seal: Seal,
+) -> Result<(), error::Unspecified>
+where
+    Seal: Fn(aead::Nonce, &[u8], &mut Vec<u8>) -> Result<aead::Tag, error::Unspecified>,
+{
+    for prefix_len in [0, 1, 63] {
+        let mut ciphertext = vec![0xff; prefix_len];
+        let tag = seal(
+            aead::Nonce::assume_unique_for_key(tc.nonce),
+            tc.plaintext,
+            &mut ciphertext,
+        )?;
+
+        assert_eq!(ciphertext[..prefix_len], vec![0xff; prefix_len]);
+        assert_eq!(ciphertext[prefix_len..], tc.ciphertext[..]);
+        assert_eq!(tag.as_ref(), tc.tag);
+    }
 
     Ok(())
 }
@@ -318,6 +345,28 @@ where
     Ok(())
 }
 
+fn test_open_to_vec<OpenInPlace>(
+    tc: &KnownAnswerTestCase<'_>,
+    open_in_place: OpenInPlace,
+) -> Result<(), error::Unspecified>
+where
+    OpenInPlace: Fn(aead::Nonce, &[u8], &mut Vec<u8>) -> Result<(), error::Unspecified>,
+{
+    for prefix_len in [0, 1, 63] {
+        let nonce = aead::Nonce::assume_unique_for_key(tc.nonce);
+
+        let mut input = Vec::from(tc.ciphertext);
+        input.extend_from_slice(tc.tag);
+
+        let mut actual_plaintext = vec![0xff; prefix_len];
+        open_in_place(nonce, &input, &mut actual_plaintext)?;
+
+        assert_eq!(actual_plaintext[..prefix_len], vec![0xff; prefix_len]);
+        assert_eq!(actual_plaintext[prefix_len..], tc.plaintext[..]);
+    }
+    Ok(())
+}
+
 fn sealing_key_seal_in_place_append_tag(
     alg: &'static aead::Algorithm,
     tc: KnownAnswerTestCase,
@@ -335,6 +384,16 @@ fn sealing_key_seal_in_place_separate_tag(
     test_seal_separate_tag(&tc, |nonce, in_out| {
         let mut key: aead::SealingKey<_> = make_key(alg, tc.key, nonce);
         key.seal_in_place_separate_tag(tc.aad, in_out)
+    })
+}
+
+fn sealing_key_seal_to_vec_separate_tag(
+    alg: &'static aead::Algorithm,
+    tc: KnownAnswerTestCase,
+) -> Result<(), error::Unspecified> {
+    test_seal_to_vec_separate_tag(&tc, |nonce, input, output| {
+        let mut key: aead::SealingKey<OneNonceSequence> = make_key(alg, tc.key, nonce);
+        key.seal_to_vec_separate_tag(tc.aad, input, output)
     })
 }
 
@@ -358,6 +417,16 @@ fn opening_key_open_within(
     })
 }
 
+fn opening_key_open_to_vec(
+    alg: &'static aead::Algorithm,
+    tc: KnownAnswerTestCase,
+) -> Result<(), error::Unspecified> {
+    test_open_to_vec(&tc, |nonce, input, output| {
+        let mut key: aead::OpeningKey<_> = make_key(alg, tc.key, nonce);
+        key.open_to_vec(tc.aad, input, output)
+    })
+}
+
 fn less_safe_key_seal_in_place_append_tag(
     alg: &'static aead::Algorithm,
     tc: KnownAnswerTestCase,
@@ -365,6 +434,16 @@ fn less_safe_key_seal_in_place_append_tag(
     test_seal_append_tag(&tc, |nonce, in_out| {
         let key = make_less_safe_key(alg, tc.key);
         key.seal_in_place_append_tag(nonce, tc.aad, in_out)
+    })
+}
+
+fn less_safe_key_seal_to_vec_separate_tag(
+    alg: &'static aead::Algorithm,
+    tc: KnownAnswerTestCase,
+) -> Result<(), error::Unspecified> {
+    test_seal_to_vec_separate_tag(&tc, |nonce, input, output| {
+        let key = make_less_safe_key(alg, tc.key);
+        key.seal_to_vec_separate_tag(nonce, tc.aad, input, output)
     })
 }
 
@@ -395,6 +474,16 @@ fn less_safe_key_open_within(
     test_open_within(&tc, |nonce, in_out, ciphertext_and_tag| {
         let key = make_less_safe_key(alg, tc.key);
         key.open_within(nonce, tc.aad, in_out, ciphertext_and_tag)
+    })
+}
+
+fn less_safe_key_open_to_vec(
+    alg: &'static aead::Algorithm,
+    tc: KnownAnswerTestCase,
+) -> Result<(), error::Unspecified> {
+    test_open_to_vec(&tc, |nonce, input, output| {
+        let key = make_less_safe_key(alg, tc.key);
+        key.open_to_vec(nonce, tc.aad, input, output)
     })
 }
 

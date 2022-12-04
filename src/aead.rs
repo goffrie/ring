@@ -22,7 +22,6 @@
 //! [`crypto.cipher.AEAD`]: https://golang.org/pkg/crypto/cipher/#AEAD
 
 use crate::{cpu, error, hkdf, polyfill};
-use core::ops::RangeFrom;
 
 pub use self::{
     aes_gcm::{AES_128_GCM, AES_256_GCM},
@@ -134,13 +133,31 @@ impl hkdf::KeyType for &'static Algorithm {
 pub struct Algorithm {
     init: fn(key: &[u8], cpu_features: cpu::Features) -> Result<KeyInner, error::Unspecified>,
 
-    seal: fn(key: &KeyInner, nonce: Nonce, aad: Aad<&[u8]>, in_out: &mut [u8]) -> Tag,
-    open: fn(
+    // Safety: `plaintext` and `out` must each reference a valid memory region of `len` bytes,
+    // all bytes reachable via `plaintext` must be initialized, and the two
+    // pointers must either not alias or be equal.
+    //
+    // When this function returns successfully, `len` bytes starting at `out` will be be initialized.
+    seal: unsafe fn(
         key: &KeyInner,
         nonce: Nonce,
         aad: Aad<&[u8]>,
-        in_out: &mut [u8],
-        src: RangeFrom<usize>,
+        plaintext: *const u8,
+        out: *mut u8,
+        len: usize,
+    ) -> Tag,
+    // Safety: `ciphertext` and `out` must each reference valid memory region of `len` bytes,
+    // all bytes reachable via `ciphertext` must be initialized, and the two
+    // pointers must either not alias, or point to the same allocation obeying `out <= ciphertext`.
+    //
+    // When this function returns successfully, `len` bytes starting at `out` will be be initialized.
+    open: unsafe fn(
+        key: &KeyInner,
+        nonce: Nonce,
+        aad: Aad<&[u8]>,
+        ciphertext: *const u8,
+        out: *mut u8,
+        len: usize,
     ) -> Tag,
 
     key_len: usize,
@@ -246,5 +263,4 @@ mod opening_key;
 mod poly1305;
 pub mod quic;
 mod sealing_key;
-mod shift;
 mod unbound_key;

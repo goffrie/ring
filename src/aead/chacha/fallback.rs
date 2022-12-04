@@ -17,13 +17,13 @@
 
 use super::{Counter, Key, BLOCK_LEN};
 use crate::polyfill::ChunksFixedMut;
-use core::ops::RangeFrom;
 
-pub(super) fn ChaCha20_ctr32(
+pub(super) unsafe fn ChaCha20_ctr32(
     key: &Key,
     counter: Counter,
-    in_out: &mut [u8],
-    src: RangeFrom<usize>,
+    mut input: *const u8,
+    mut output: *mut u8,
+    mut len: usize,
 ) {
     const SIGMA: [u32; 4] = [
         u32::from_le_bytes(*b"expa"),
@@ -40,25 +40,21 @@ pub(super) fn ChaCha20_ctr32(
         key[6], key[7], counter[0], counter[1], counter[2], counter[3],
     ];
 
-    let mut in_out_len = in_out.len().checked_sub(src.start).unwrap();
-    let mut input = in_out[src].as_ptr();
-    let mut output = in_out.as_mut_ptr();
-
     let mut buf = [0u8; BLOCK_LEN];
-    while in_out_len > 0 {
+    while len > 0 {
         chacha_core(&mut buf, &state);
         state[12] += 1;
 
-        let todo = core::cmp::min(BLOCK_LEN, in_out_len);
+        let todo = core::cmp::min(BLOCK_LEN, len);
         for (i, &b) in buf[..todo].iter().enumerate() {
-            let input = unsafe { *input.add(i) };
+            let input = *input.add(i);
             let b = input ^ b;
-            unsafe { *output.add(i) = b };
+            output.add(i).write(b);
         }
 
-        in_out_len -= todo;
-        input = unsafe { input.add(todo) };
-        output = unsafe { output.add(todo) };
+        len -= todo;
+        input = input.add(todo);
+        output = output.add(todo);
     }
 }
 

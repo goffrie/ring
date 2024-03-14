@@ -28,20 +28,20 @@ use core::ops::RangeFrom;
 
 #[derive(Clone)]
 pub(super) struct Key {
-    inner: AES_KEY,
+    inner: AesKey,
 }
 
-macro_rules! set_encrypt_key {
+macro_rules! set_encrypt_key_asm {
     ( $name:ident, $bytes:expr, $key_bits:expr, $key:expr ) => {{
         prefixed_extern! {
             fn $name(user_key: *const u8, bits: c::uint, key: &mut AES_KEY) -> c::int;
         }
-        set_encrypt_key($name, $bytes, $key_bits, $key)
+        set_encrypt_key_asm($name, $bytes, $key_bits, $key)
     }};
 }
 
 #[inline]
-fn set_encrypt_key(
+unsafe fn set_encrypt_key_asm(
     f: unsafe extern "C" fn(*const u8, c::uint, &mut AES_KEY) -> c::int,
     bytes: &[u8],
     key_bits: BitLength,
@@ -56,7 +56,7 @@ fn set_encrypt_key(
     }
 }
 
-macro_rules! encrypt_block {
+macro_rules! encrypt_block_asm {
     ($name:ident, $block:expr, $key:expr) => {{
         prefixed_extern! {
             fn $name(a: &Block, r: *mut Block, key: &AES_KEY);
@@ -73,12 +73,12 @@ fn encrypt_block_(
 ) -> Block {
     let mut result = core::mem::MaybeUninit::uninit();
     unsafe {
-        f(&a, result.as_mut_ptr(), &key.inner);
+        f(&a, result.as_mut_ptr(), &key.inner.asm);
         result.assume_init()
     }
 }
 
-macro_rules! ctr32_encrypt_blocks {
+macro_rules! ctr32_encrypt_blocks_asm {
     ($name:ident, $in_out:expr, $src:expr, $key:expr, $ivec:expr ) => {{
         prefixed_extern! {
             fn $name(
@@ -89,12 +89,12 @@ macro_rules! ctr32_encrypt_blocks {
                 ivec: &Counter,
             );
         }
-        ctr32_encrypt_blocks_($name, $in_out, $src, $key, $ivec)
+        ctr32_encrypt_blocks_asm_($name, $in_out, $src, $key, $ivec)
     }};
 }
 
 #[inline]
-fn ctr32_encrypt_blocks_(
+unsafe fn ctr32_encrypt_blocks_asm_(
     f: unsafe extern "C" fn(
         input: *const [u8; BLOCK_LEN],
         output: *mut [u8; BLOCK_LEN],
@@ -139,10 +139,7 @@ impl Key {
             return Err(error::Unspecified);
         }
 
-        let mut key = AES_KEY {
-            rd_key: [0u32; 4 * (MAX_ROUNDS + 1)],
-            rounds: 0,
-        };
+        let mut key;
 
         match detect_implementation(cpu_features) {
             #[cfg(any(
@@ -152,7 +149,10 @@ impl Key {
                 target_arch = "x86"
             ))]
             Implementation::HWAES => {
-                set_encrypt_key!(aes_hw_set_encrypt_key, bytes, key_bits, &mut key)?
+                key = AesKey { asm: AES_KEY::default() };
+                unsafe {
+                    set_encrypt_key_asm!(aes_hw_set_encrypt_key, bytes, key_bits, &mut key.asm)?
+                }
             }
 
             #[cfg(any(
@@ -162,11 +162,15 @@ impl Key {
                 target_arch = "x86"
             ))]
             Implementation::VPAES_BSAES => {
-                set_encrypt_key!(vpaes_set_encrypt_key, bytes, key_bits, &mut key)?
+                key = AesKey { asm: AES_KEY::default() };
+                unsafe {
+                    set_encrypt_key_asm!(vpaes_set_encrypt_key, bytes, key_bits, &mut key.asm)?
+                }
             }
 
             Implementation::NOHW => {
-                set_encrypt_key!(aes_nohw_set_encrypt_key, bytes, key_bits, &mut key)?
+                todo!();
+                // set_encrypt_key!(aes_nohw_set_encrypt_key, bytes, key_bits, &mut key)?
             }
         };
 
@@ -182,7 +186,7 @@ impl Key {
                 target_arch = "x86_64",
                 target_arch = "x86"
             ))]
-            Implementation::HWAES => encrypt_block!(aes_hw_encrypt, a, self),
+            Implementation::HWAES => encrypt_block_asm!(aes_hw_encrypt, a, self),
 
             #[cfg(any(
                 target_arch = "aarch64",
@@ -190,9 +194,9 @@ impl Key {
                 target_arch = "x86_64",
                 target_arch = "x86"
             ))]
-            Implementation::VPAES_BSAES => encrypt_block!(vpaes_encrypt, a, self),
+            Implementation::VPAES_BSAES => encrypt_block_asm!(vpaes_encrypt, a, self),
 
-            Implementation::NOHW => encrypt_block!(aes_nohw_encrypt, a, self),
+            Implementation::NOHW => encrypt_block_asm!(aes_nohw_encrypt, a, self),
         }
     }
 
@@ -222,7 +226,9 @@ impl Key {
                 target_arch = "x86"
             ))]
             Implementation::HWAES => {
-                ctr32_encrypt_blocks!(aes_hw_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
+                unsafe {
+                    ctr32_encrypt_blocks_asm!(aes_hw_ctr32_encrypt_blocks, in_out, src, &self.inner.asm, ctr)
+                }
             }
 
             #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64"))]
@@ -245,22 +251,24 @@ impl Key {
                         fn vpaes_encrypt_key_to_bsaes(bsaes_key: &mut AES_KEY, vpaes_key: &AES_KEY);
                     }
                     unsafe {
-                        vpaes_encrypt_key_to_bsaes(&mut bsaes_key, &self.inner);
+                        vpaes_encrypt_key_to_bsaes(&mut bsaes_key, &self.inner.asm);
+                        ctr32_encrypt_blocks_asm!(
+                            bsaes_ctr32_encrypt_blocks,
+                            &mut in_out[..(src.start + bsaes_in_out_len)],
+                            src.clone(),
+                            &bsaes_key,
+                            ctr
+                        );
                     }
-                    ctr32_encrypt_blocks!(
-                        bsaes_ctr32_encrypt_blocks,
-                        &mut in_out[..(src.start + bsaes_in_out_len)],
-                        src.clone(),
-                        &bsaes_key,
-                        ctr
-                    );
 
                     &mut in_out[bsaes_in_out_len..]
                 } else {
                     in_out
                 };
 
-                ctr32_encrypt_blocks!(vpaes_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
+                unsafe {
+                    ctr32_encrypt_blocks_asm!(vpaes_ctr32_encrypt_blocks, in_out, src, &self.inner.asm, ctr)
+                }
             }
 
             #[cfg(target_arch = "x86")]
@@ -271,7 +279,8 @@ impl Key {
             }
 
             Implementation::NOHW => {
-                ctr32_encrypt_blocks!(aes_nohw_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
+                todo!();
+                // ctr32_encrypt_blocks_asm!(aes_nohw_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
             }
         }
     }
@@ -291,23 +300,41 @@ impl Key {
         matches!(detect_implementation(cpu_features), Implementation::HWAES)
     }
 
+    /// # Safety
+    /// Requires that `self.is_aes_hw()` is `true`.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[must_use]
-    pub(super) fn inner_less_safe(&self) -> &AES_KEY {
-        &self.inner
+    pub(super) unsafe fn inner_less_safe(&self) -> &AES_KEY {
+        &self.inner.asm
     }
 }
 
-// Keep this in sync with AES_KEY in aes.h.
+// AES_KEY structure used by assembly language aes_hw routines.
 #[repr(C)]
-#[derive(Clone)]
-pub(super) struct AES_KEY {
+#[derive(Copy, Clone)]
+pub(crate) struct AES_KEY {
     pub rd_key: [u32; 4 * (MAX_ROUNDS + 1)],
     pub rounds: c::uint,
 }
 
-// Keep this in sync with `AES_MAXNR` in aes.h.
+impl Default for AES_KEY {
+    fn default() -> Self {
+        Self {
+            rd_key: [0; 4 * (MAX_ROUNDS + 1)],
+            rounds: 0,
+        }
+    }
+}
+
+// Maximum number of rounds for AES; AES-256 has 14 rounds.
 const MAX_ROUNDS: usize = 14;
+
+#[derive(Copy, Clone)]
+union AesKey {
+    asm: AES_KEY,
+    fixslice_128: crate::rust_crypto::aes::soft::fixslice::FixsliceKeys128,
+    fixslice_256: crate::rust_crypto::aes::soft::fixslice::FixsliceKeys256,
+}
 
 pub enum Variant {
     AES_128,

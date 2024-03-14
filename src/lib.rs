@@ -118,6 +118,8 @@ mod limb;
 pub mod pbkdf2;
 pub mod pkcs8;
 pub mod rand;
+#[allow(unused)]
+pub(crate) mod rust_crypto;
 
 #[cfg(feature = "alloc")]
 pub mod rsa;

@@ -254,7 +254,6 @@ impl Key {
             Implementation::VPAES_BSAES => unsafe { encrypt_block_asm!(vpaes_encrypt, a, self) },
 
             Implementation::NOHW => {
-                // XXX: is this wasteful? encrypt_block isn't used for bulk encryption.
                 let mut blocks = [[0; BLOCK_LEN]; fixslice::FIXSLICE_BLOCKS];
                 blocks[0] = *a.as_ref();
                 let ciphertext_blocks = match self.inner {

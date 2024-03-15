@@ -23,6 +23,7 @@ use crate::{
     endian::BigEndian,
     error,
     polyfill::{self, ArraySplitMap},
+    rust_crypto::aes::soft::fixslice,
 };
 use core::ops::RangeFrom;
 
@@ -66,14 +67,14 @@ macro_rules! encrypt_block_asm {
 }
 
 #[inline]
-fn encrypt_block_(
+unsafe fn encrypt_block_(
     f: unsafe extern "C" fn(&Block, *mut Block, &AES_KEY),
     a: Block,
     key: &Key,
 ) -> Block {
     let mut result = core::mem::MaybeUninit::uninit();
     unsafe {
-        f(&a, result.as_mut_ptr(), &key.inner.asm);
+        f(&a, result.as_mut_ptr(), key.inner.asm_key());
         result.assume_init()
     }
 }
@@ -104,7 +105,7 @@ unsafe fn ctr32_encrypt_blocks_asm_(
     ),
     in_out: &mut [u8],
     src: RangeFrom<usize>,
-    key: &AES_KEY,
+    key: &Key,
     ctr: &mut Counter,
 ) {
     let in_out_len = in_out[src.clone()].len();
@@ -119,9 +120,61 @@ unsafe fn ctr32_encrypt_blocks_asm_(
     let output = in_out.as_mut_ptr().cast::<[u8; BLOCK_LEN]>();
 
     unsafe {
-        f(input, output, blocks, key, ctr);
+        f(input, output, blocks, key.inner.asm_key(), ctr);
     }
     ctr.increment_by_less_safe(blocks_u32);
+}
+
+fn xor_within(in_out: &mut [u8], src: RangeFrom<usize>, keystream: &[[u8; 16]]) {
+    for (i, &keystream_block) in keystream.iter().enumerate() {
+        let input_block = u128::from_ne_bytes(
+            in_out[src.clone()][i * BLOCK_LEN..][..BLOCK_LEN]
+                .try_into()
+                .unwrap(),
+        );
+        let keystream_block = u128::from_ne_bytes(keystream_block);
+        in_out[i * BLOCK_LEN..][..BLOCK_LEN]
+            .copy_from_slice(&(input_block ^ keystream_block).to_ne_bytes());
+    }
+}
+
+fn ctr32_encrypt_blocks_fixslice<K>(
+    f: impl Fn(&K, &fixslice::BatchBlocks) -> fixslice::BatchBlocks,
+    key: &K,
+    in_out: &mut [u8],
+    src: RangeFrom<usize>,
+    ctr: &mut Counter,
+) {
+    let in_out_len = in_out[src.clone()].len();
+    assert_eq!(in_out_len % BLOCK_LEN, 0);
+    let blocks = in_out_len / BLOCK_LEN;
+    let mut plaintext_batch = [[0; BLOCK_LEN]; fixslice::FIXSLICE_BLOCKS];
+    let batches = blocks / fixslice::FIXSLICE_BLOCKS;
+    for batch in 0..batches {
+        for i in 0..fixslice::FIXSLICE_BLOCKS {
+            plaintext_batch[i] = *ctr.increment().into_block_less_safe().as_ref();
+        }
+        let keystream_batch = f(key, &plaintext_batch);
+        xor_within(
+            &mut in_out[batch * fixslice::FIXSLICE_BLOCKS * BLOCK_LEN..],
+            src.clone(),
+            &keystream_batch,
+        );
+    }
+    let leftover = blocks % fixslice::FIXSLICE_BLOCKS;
+    if leftover > 0 {
+        for i in 0..leftover {
+            plaintext_batch[i] = *ctr.increment().into_block_less_safe().as_ref();
+        }
+        // plaintext_batch[leftover..] is just junk from previous iterations,
+        // but we don't use it.
+        let keystream_batch = f(key, &plaintext_batch);
+        xor_within(
+            &mut in_out[batches * fixslice::FIXSLICE_BLOCKS * BLOCK_LEN..],
+            src.clone(),
+            &keystream_batch[..leftover],
+        );
+    }
 }
 
 impl Key {
@@ -139,9 +192,7 @@ impl Key {
             return Err(error::Unspecified);
         }
 
-        let mut key;
-
-        match detect_implementation(cpu_features) {
+        let key = match detect_implementation(cpu_features) {
             #[cfg(any(
                 target_arch = "aarch64",
                 target_arch = "arm",
@@ -149,10 +200,11 @@ impl Key {
                 target_arch = "x86"
             ))]
             Implementation::HWAES => {
-                key = AesKey { asm: AES_KEY::default() };
+                let mut key = AES_KEY::default();
                 unsafe {
-                    set_encrypt_key_asm!(aes_hw_set_encrypt_key, bytes, key_bits, &mut key.asm)?
+                    set_encrypt_key_asm!(aes_hw_set_encrypt_key, bytes, key_bits, &mut key)?;
                 }
+                AesKey::Asm(key)
             }
 
             #[cfg(any(
@@ -162,16 +214,21 @@ impl Key {
                 target_arch = "x86"
             ))]
             Implementation::VPAES_BSAES => {
-                key = AesKey { asm: AES_KEY::default() };
+                let mut key = AES_KEY::default();
                 unsafe {
-                    set_encrypt_key_asm!(vpaes_set_encrypt_key, bytes, key_bits, &mut key.asm)?
+                    set_encrypt_key_asm!(vpaes_set_encrypt_key, bytes, key_bits, &mut key)?;
                 }
+                AesKey::Asm(key)
             }
 
-            Implementation::NOHW => {
-                todo!();
-                // set_encrypt_key!(aes_nohw_set_encrypt_key, bytes, key_bits, &mut key)?
-            }
+            Implementation::NOHW => match variant {
+                Variant::AES_128 => AesKey::Soft128(fixslice::aes128_key_schedule(
+                    bytes.try_into().map_err(|_| error::Unspecified)?,
+                )),
+                Variant::AES_256 => AesKey::Soft256(fixslice::aes256_key_schedule(
+                    bytes.try_into().map_err(|_| error::Unspecified)?,
+                )),
+            },
         };
 
         Ok(Self { inner: key })
@@ -186,7 +243,7 @@ impl Key {
                 target_arch = "x86_64",
                 target_arch = "x86"
             ))]
-            Implementation::HWAES => encrypt_block_asm!(aes_hw_encrypt, a, self),
+            Implementation::HWAES => unsafe { encrypt_block_asm!(aes_hw_encrypt, a, self) },
 
             #[cfg(any(
                 target_arch = "aarch64",
@@ -194,9 +251,19 @@ impl Key {
                 target_arch = "x86_64",
                 target_arch = "x86"
             ))]
-            Implementation::VPAES_BSAES => encrypt_block_asm!(vpaes_encrypt, a, self),
+            Implementation::VPAES_BSAES => unsafe { encrypt_block_asm!(vpaes_encrypt, a, self) },
 
-            Implementation::NOHW => encrypt_block_asm!(aes_nohw_encrypt, a, self),
+            Implementation::NOHW => {
+                // XXX: is this wasteful? encrypt_block isn't used for bulk encryption.
+                let mut blocks = [[0; BLOCK_LEN]; fixslice::FIXSLICE_BLOCKS];
+                blocks[0] = *a.as_ref();
+                let ciphertext_blocks = match self.inner {
+                    AesKey::Asm(_) => unreachable!(),
+                    AesKey::Soft128(ref key) => fixslice::aes128_encrypt(key, &blocks),
+                    AesKey::Soft256(ref key) => fixslice::aes256_encrypt(key, &blocks),
+                };
+                (&ciphertext_blocks[0]).into()
+            }
         }
     }
 
@@ -225,11 +292,9 @@ impl Key {
                 target_arch = "x86_64",
                 target_arch = "x86"
             ))]
-            Implementation::HWAES => {
-                unsafe {
-                    ctr32_encrypt_blocks_asm!(aes_hw_ctr32_encrypt_blocks, in_out, src, &self.inner.asm, ctr)
-                }
-            }
+            Implementation::HWAES => unsafe {
+                ctr32_encrypt_blocks_asm!(aes_hw_ctr32_encrypt_blocks, in_out, src, self, ctr)
+            },
 
             #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64"))]
             Implementation::VPAES_BSAES => {
@@ -251,7 +316,7 @@ impl Key {
                         fn vpaes_encrypt_key_to_bsaes(bsaes_key: &mut AES_KEY, vpaes_key: &AES_KEY);
                     }
                     unsafe {
-                        vpaes_encrypt_key_to_bsaes(&mut bsaes_key, &self.inner.asm);
+                        vpaes_encrypt_key_to_bsaes(&mut bsaes_key, self.inner.asm_key());
                         ctr32_encrypt_blocks_asm!(
                             bsaes_ctr32_encrypt_blocks,
                             &mut in_out[..(src.start + bsaes_in_out_len)],
@@ -267,7 +332,7 @@ impl Key {
                 };
 
                 unsafe {
-                    ctr32_encrypt_blocks_asm!(vpaes_ctr32_encrypt_blocks, in_out, src, &self.inner.asm, ctr)
+                    ctr32_encrypt_blocks_asm!(vpaes_ctr32_encrypt_blocks, in_out, src, self, ctr)
                 }
             }
 
@@ -278,10 +343,15 @@ impl Key {
                 });
             }
 
-            Implementation::NOHW => {
-                todo!();
-                // ctr32_encrypt_blocks_asm!(aes_nohw_ctr32_encrypt_blocks, in_out, src, &self.inner, ctr)
-            }
+            Implementation::NOHW => match self.inner {
+                AesKey::Asm(_) => unreachable!(),
+                AesKey::Soft128(ref key) => {
+                    ctr32_encrypt_blocks_fixslice(fixslice::aes128_encrypt, key, in_out, src, ctr)
+                }
+                AesKey::Soft256(ref key) => {
+                    ctr32_encrypt_blocks_fixslice(fixslice::aes256_encrypt, key, in_out, src, ctr)
+                }
+            },
         }
     }
 
@@ -305,7 +375,7 @@ impl Key {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[must_use]
     pub(super) unsafe fn inner_less_safe(&self) -> &AES_KEY {
-        &self.inner.asm
+        self.inner.asm_key()
     }
 }
 
@@ -330,10 +400,19 @@ impl Default for AES_KEY {
 const MAX_ROUNDS: usize = 14;
 
 #[derive(Copy, Clone)]
-union AesKey {
-    asm: AES_KEY,
-    fixslice_128: crate::rust_crypto::aes::soft::fixslice::FixsliceKeys128,
-    fixslice_256: crate::rust_crypto::aes::soft::fixslice::FixsliceKeys256,
+enum AesKey {
+    Asm(AES_KEY),
+    Soft128(fixslice::FixsliceKeys128),
+    Soft256(fixslice::FixsliceKeys256),
+}
+
+impl AesKey {
+    fn asm_key(&self) -> &AES_KEY {
+        match self {
+            AesKey::Asm(key) => key,
+            _ => unreachable!(),
+        }
+    }
 }
 
 pub enum Variant {

@@ -397,6 +397,7 @@ impl Default for AES_KEY {
 // Maximum number of rounds for AES; AES-256 has 14 rounds.
 const MAX_ROUNDS: usize = 14;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Copy, Clone)]
 enum AesKey {
     Asm(AES_KEY),

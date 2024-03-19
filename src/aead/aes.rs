@@ -109,7 +109,7 @@ unsafe fn ctr32_encrypt_blocks_asm_(
     ),
     in_out: &mut [u8],
     src: RangeFrom<usize>,
-    key: &Key,
+    key: &AES_KEY,
     ctr: &mut Counter,
 ) {
     let in_out_len = in_out[src.clone()].len();
@@ -124,7 +124,7 @@ unsafe fn ctr32_encrypt_blocks_asm_(
     let output = in_out.as_mut_ptr().cast::<[u8; BLOCK_LEN]>();
 
     unsafe {
-        f(input, output, blocks, key.inner.asm_key(), ctr);
+        f(input, output, blocks, key, ctr);
     }
     ctr.increment_by_less_safe(blocks_u32);
 }
@@ -291,7 +291,13 @@ impl Key {
                 target_arch = "x86"
             ))]
             Implementation::HWAES => unsafe {
-                ctr32_encrypt_blocks_asm!(aes_hw_ctr32_encrypt_blocks, in_out, src, self, ctr)
+                ctr32_encrypt_blocks_asm!(
+                    aes_hw_ctr32_encrypt_blocks,
+                    in_out,
+                    src,
+                    self.inner.asm_key(),
+                    ctr
+                )
             },
 
             #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64"))]
@@ -330,7 +336,13 @@ impl Key {
                 };
 
                 unsafe {
-                    ctr32_encrypt_blocks_asm!(vpaes_ctr32_encrypt_blocks, in_out, src, self, ctr)
+                    ctr32_encrypt_blocks_asm!(
+                        vpaes_ctr32_encrypt_blocks,
+                        in_out,
+                        src,
+                        self.inner.asm_key(),
+                        ctr
+                    )
                 }
             }
 

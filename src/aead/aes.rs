@@ -150,8 +150,8 @@ fn ctr32_encrypt_blocks_fixslice<K>(
     let mut plaintext_batch = [[0; BLOCK_LEN]; fixslice::FIXSLICE_BLOCKS];
     let batches = blocks / fixslice::FIXSLICE_BLOCKS;
     for batch in 0..batches {
-        for i in 0..fixslice::FIXSLICE_BLOCKS {
-            plaintext_batch[i] = *ctr.increment().into_block_less_safe().as_ref();
+        for ctr_block in &mut plaintext_batch {
+            *ctr_block = *ctr.increment().into_block_less_safe().as_ref();
         }
         let keystream_batch = f(key, &plaintext_batch);
         xor_within(
@@ -162,8 +162,8 @@ fn ctr32_encrypt_blocks_fixslice<K>(
     }
     let leftover = blocks % fixslice::FIXSLICE_BLOCKS;
     if leftover > 0 {
-        for i in 0..leftover {
-            plaintext_batch[i] = *ctr.increment().into_block_less_safe().as_ref();
+        for ctr_block in &mut plaintext_batch[..leftover] {
+            *ctr_block = *ctr.increment().into_block_less_safe().as_ref();
         }
         // plaintext_batch[leftover..] is just junk from previous iterations,
         // but we don't use it.

@@ -486,11 +486,7 @@ macro_rules! define_mix_columns {
     }
 }
 
-define_mix_columns!(
-    mix_columns_0,
-    rotate_rows_1,
-    rotate_rows_2
-);
+define_mix_columns!(mix_columns_0, rotate_rows_1, rotate_rows_2);
 
 define_mix_columns!(
     mix_columns_1,
@@ -499,11 +495,7 @@ define_mix_columns!(
 );
 
 #[cfg(not(aes_compact))]
-define_mix_columns!(
-    mix_columns_2,
-    rotate_rows_and_columns_1_2,
-    rotate_rows_2
-);
+define_mix_columns!(mix_columns_2, rotate_rows_and_columns_1_2, rotate_rows_2);
 
 #[cfg(not(aes_compact))]
 define_mix_columns!(

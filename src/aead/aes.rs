@@ -22,7 +22,11 @@ use crate::{
     c, cpu,
     endian::BigEndian,
     error,
-    polyfill::{self, ArraySplitMap},
+    polyfill::{
+        self,
+        slice::{as_chunks, as_chunks_mut},
+        ArraySplitMap,
+    },
     rust_crypto::aes::soft::fixslice,
 };
 use core::ops::RangeFrom;
@@ -127,14 +131,9 @@ unsafe fn ctr32_encrypt_blocks_asm_(
 
 fn xor_within(in_out: &mut [u8], src: RangeFrom<usize>, keystream: &[[u8; 16]]) {
     for (i, &keystream_block) in keystream.iter().enumerate() {
-        let input_block = u128::from_ne_bytes(
-            in_out[src.clone()][i * BLOCK_LEN..][..BLOCK_LEN]
-                .try_into()
-                .unwrap(),
-        );
+        let input_block = u128::from_ne_bytes(as_chunks(&in_out[src.clone()]).0[i]);
         let keystream_block = u128::from_ne_bytes(keystream_block);
-        in_out[i * BLOCK_LEN..][..BLOCK_LEN]
-            .copy_from_slice(&(input_block ^ keystream_block).to_ne_bytes());
+        as_chunks_mut(in_out).0[i] = (input_block ^ keystream_block).to_ne_bytes();
     }
 }
 

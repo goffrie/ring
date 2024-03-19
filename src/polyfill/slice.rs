@@ -36,3 +36,17 @@ pub fn as_chunks<T, const N: usize>(slice: &[T]) -> (&[[T; N]], &[T]) {
     let chunked = unsafe { core::slice::from_raw_parts(multiple_of_n.as_ptr().cast(), len) };
     (chunked, remainder)
 }
+
+// TODO(MSRV feature(slice_as_chunks)): Use `slice::as_chunks_mut` instead.
+// This is copied from the libcore implementation of `slice::as_chunks_mut`.
+#[inline(always)]
+pub fn as_chunks_mut<T, const N: usize>(slice: &mut [T]) -> (&mut [[T; N]], &mut [T]) {
+    assert!(N != 0, "chunk size must be non-zero");
+    let len = slice.len() / N;
+    let (multiple_of_n, remainder) = slice.split_at_mut(len * N);
+    // SAFETY: We already panicked for zero, and ensured by construction
+    // that the length of the subslice is a multiple of N.
+    let array_slice =
+        unsafe { core::slice::from_raw_parts_mut(multiple_of_n.as_mut_ptr().cast(), len) };
+    (array_slice, remainder)
+}
